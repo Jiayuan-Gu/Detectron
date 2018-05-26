@@ -129,6 +129,46 @@ def mask_rcnn_fcn_head_v1up(model, blob_in, dim_in, spatial_scale):
     )
 
 
+def mask_rcnn_mlp_head(model, blob_in, dim_in, spatial_scale):
+    """mlp design: 2 fc."""
+    return mask_rcnn_mlp_head_Xfcs(
+        model, blob_in, dim_in, spatial_scale, 2
+    )
+
+
+def mask_rcnn_mlp_head_Xfcs(
+    model, blob_in, dim_in, spatial_scale, num_fcs
+):
+    current = model.RoIFeatureTransform(
+        blob_in,
+        blob_out='_[mask]_roi_feat',
+        blob_rois='mask_rois',
+        method=cfg.MRCNN.ROI_XFORM_METHOD,
+        resolution=cfg.MRCNN.ROI_XFORM_RESOLUTION,
+        sampling_ratio=cfg.MRCNN.ROI_XFORM_SAMPLING_RATIO,
+        spatial_scale=spatial_scale
+    )
+
+    dim_in = dim_in * (cfg.MRCNN.ROI_XFORM_RESOLUTION ** 2)
+    dim_inner = cfg.MRCNN.DIM_REDUCED
+
+    for i in range(num_fcs):
+        current = model.FC(
+            current,
+            '_[mask]_fc' + str(i + 1),
+            dim_in,
+            dim_inner,
+            weight_init=(cfg.MRCNN.CONV_INIT, {'std': 0.001}),
+            bias_init=('ConstantFill', {'value': 0.})
+        )
+        current = model.Relu(current, current)
+        dim_in = dim_inner
+
+    blob_mask = current
+
+    return blob_mask, dim_inner
+
+
 def mask_rcnn_fcn_head_v1upXconvs(
     model, blob_in, dim_in, spatial_scale, num_convs
 ):
