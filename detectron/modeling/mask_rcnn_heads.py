@@ -139,17 +139,30 @@ def mask_rcnn_mlp_head(model, blob_in, dim_in, spatial_scale):
 def mask_rcnn_mlp_head_Xfcs(
     model, blob_in, dim_in, spatial_scale, num_fcs
 ):
-    current = model.RoIFeatureTransform(
-        blob_in,
-        blob_out='_[mask]_roi_feat',
-        blob_rois='mask_rois',
-        method=cfg.MRCNN.ROI_XFORM_METHOD,
-        resolution=cfg.MRCNN.ROI_XFORM_RESOLUTION,
-        sampling_ratio=cfg.MRCNN.ROI_XFORM_SAMPLING_RATIO,
-        spatial_scale=spatial_scale
-    )
+    if 'AttPool' in cfg.MRCNN.ROI_XFORM_METHOD:
+        current = model.RoIFeatureTransformV2(
+            blob_in,
+            blob_out='_[mask]_roi_feat',
+            blob_rois='mask_rois',
+            method=cfg.MRCNN.ROI_XFORM_METHOD,
+            resolution=cfg.MRCNN.ROI_XFORM_RESOLUTION,
+            sampling_ratio=cfg.MRCNN.ROI_XFORM_SAMPLING_RATIO,
+            spatial_scale=spatial_scale,
+            dim_in=dim_in,
+        )
+        dim_in = dim_in * cfg.MRCNN.ROI_XFORM_RESOLUTION
+    else:
+        current = model.RoIFeatureTransform(
+            blob_in,
+            blob_out='_[mask]_roi_feat',
+            blob_rois='mask_rois',
+            method=cfg.MRCNN.ROI_XFORM_METHOD,
+            resolution=cfg.MRCNN.ROI_XFORM_RESOLUTION,
+            sampling_ratio=cfg.MRCNN.ROI_XFORM_SAMPLING_RATIO,
+            spatial_scale=spatial_scale
+        )
+        dim_in = dim_in * (cfg.MRCNN.ROI_XFORM_RESOLUTION ** 2)
 
-    dim_in = dim_in * (cfg.MRCNN.ROI_XFORM_RESOLUTION ** 2)
     dim_inner = cfg.MRCNN.DIM_REDUCED
 
     for i in range(num_fcs):

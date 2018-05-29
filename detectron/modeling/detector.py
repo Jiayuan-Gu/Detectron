@@ -34,6 +34,7 @@ from detectron.ops.collect_and_distribute_fpn_rpn_proposals \
     import CollectAndDistributeFpnRpnProposalsOp
 from detectron.ops.generate_proposal_labels import GenerateProposalLabelsOp
 from detectron.ops.generate_proposals import GenerateProposalsOp
+from detectron.ops.map_grid_generator import MapGridGeneratorOp
 import detectron.roi_data.fast_rcnn as fast_rcnn_roi_data
 import detectron.utils.c2 as c2_utils
 
@@ -299,6 +300,180 @@ class DetectionModelHelper(cnn.CNNModelHelper):
             )
         # Only return the first blob (the transformed features)
         return xform_out[0] if isinstance(xform_out, tuple) else xform_out
+
+    def RoIFeatureTransformV2(
+        self,
+        blobs_in,
+        blob_out,
+        blob_rois='rois',
+        method='AttPool',
+        resolution=48,
+        spatial_scale=1. / 16.,
+        sampling_ratio=196,
+        dim_in=256,
+    ):
+        """Add the specified RoI pooling method. The sampling_ratio argument
+        is supported for some, but not all, RoI transform methods.
+
+        RoIFeatureTransform abstracts away:
+          - Use of FPN or not
+          - Specifics of the transform method
+        """
+        assert method in {'AttPool',}, 'Unknown pooling method: {}'.format(method)
+        if isinstance(blobs_in, list):
+            # FPN case: add RoIFeatureTransform to each FPN level
+            k_max = cfg.FPN.ROI_MAX_LEVEL  # coarsest level of pyramid
+            k_min = cfg.FPN.ROI_MIN_LEVEL  # finest level of pyramid
+            assert len(blobs_in) == k_max - k_min + 1
+            bl_out_list = []
+
+            # calculate map grid feature for the finest level
+            name = 'MapGridGeneratorOp:fpn0'
+            map_grid = self.net.Python(
+                MapGridGeneratorOp(1.0 / spatial_scale[-1]).forward
+            )(blobs_in[-1], 'map_grid_fpn' + str(k_min), name=name)
+
+            # embedding
+            emd_dim = 1024
+            grid_embedding = self.GridEmbedding(map_grid, emd_dim)
+            grid_feat = None
+            num_coord = 2
+
+            for lvl in range(k_min, k_max + 1):
+                bl_in = blobs_in[k_max - lvl]  # blobs_in is in reversed order
+                sc = spatial_scale[k_max - lvl]  # in reversed order
+                bl_rois = blob_rois + '_fpn' + str(lvl)
+                bl_out = blob_out + '_fpn' + str(lvl)
+                bl_out_list.append(bl_out)
+
+                if grid_feat is None:
+                    grid_feat = self.Conv(
+                        grid_embedding,
+                        'grid_feat_fpn' + str(lvl),
+                        emd_dim,
+                        resolution * num_coord,
+                        kernel=1,
+                        stride=1,
+                        weight_init=(cfg.MRCNN.CONV_INIT, {'std': 0.01}),
+                        bias_init=('ConstantFill', {'value': 0.})
+                    )
+                else:
+                    slice0 = self.net.Slice(
+                        grid_feat,
+                        'grid_feat_slice0_fpn' + str(lvl),
+                        starts=[0, 0, 1, 0],
+                        ends=[-1, -1, -2, -1],
+                    )
+                    slice1 = self.net.Slice(
+                        slice0,
+                        'grid_feat_slice1_fpn' + str(lvl),
+                        starts=[0, 0, 0, 1],
+                        ends=[-1, -1, -1, -2],
+                    )
+                    grid_feat = self.AveragePool(
+                        slice1,
+                        'grid_feat_fpn' + str(lvl),
+                        kernel=1,
+                        stride=2,
+                        legacy_pad=1, # valid
+                    )
+
+                app_feat = self.Conv(
+                    bl_in,
+                    'app_feat_fpn' + str(lvl),
+                    dim_in,
+                    resolution,
+                    kernel=1,
+                    stride=1,
+                    weight_init=(cfg.MRCNN.CONV_INIT, {'std': 0.01}),
+                    bias_init=('ConstantFill', {'value': 0.})
+                )
+
+                # [num_rois, num_bins, max_area]
+                crop_grid_feat = self.net.AttentionCropGrid(
+                    [grid_feat, bl_rois, app_feat],
+                    'crop_grid_feat_fpn' + str(lvl),
+                    max_area=sampling_ratio,
+                    spatial_scale=sc,
+                    num_coord=num_coord
+                )
+
+                # crop_grid_feat, crop_grid_feat_shape = self.net.Reshape(
+                #     [crop_grid_feat],
+                #     ['crop_grid_feat_fpn' + str(lvl) + '_reshape', 'crop_grid_feat_fpn' + str(lvl) + '_old_shape'],
+                #     shape=(-1, sampling_ratio),
+                # )
+
+                att_softmax = self.net.SoftmaxV1(
+                    crop_grid_feat,
+                    'att_softmax_fpn' + str(lvl),
+                )
+
+                # att_softmax, _ = self.net.Reshape(
+                #     [att_softmax, crop_grid_feat_shape],
+                #     ['att_softmax_fpn' + str(lvl) + '_reshape', 'att_softmax_fpn' + str(lvl) + '_old_shape']
+                # )
+
+                att_agg = self.net.AttentionAggregation(
+                    [bl_in, bl_rois, att_softmax],
+                    # 'att_agg_fpn' + str(lvl),
+                    bl_out,
+                    max_area=sampling_ratio,
+                    spatial_scale=sc,
+                )
+
+                # att_agg_t = self.net.Transpose(
+                #     att_agg,
+                #     att_agg + '_trans',
+                #     axes=[0, 2, 1]
+                # )
+
+                # import math
+                # k = int(math.sqrt(resolution))
+                # self.net.Reshape(
+                #     att_agg,
+                #     [bl_out, att_agg + '_old_shape'],
+                #     shape=(0, k, k, -1)
+                # )
+
+            # The pooled features from all levels are concatenated along the
+            # batch dimension into a single 3D tensor.
+            xform_shuffled, _ = self.net.Concat(
+                bl_out_list, [blob_out + '_shuffled', '_concat_' + blob_out],
+                axis=0
+            )
+            # Unshuffle to match rois from dataloader
+            restore_bl = blob_rois + '_idx_restore_int32'
+            xform_out = self.net.BatchPermutation(
+                [xform_shuffled, restore_bl], blob_out
+            )
+        else:
+            raise NotImplementedError()
+
+        # Only return the first blob (the transformed features)
+        return xform_out[0] if isinstance(xform_out, tuple) else xform_out
+
+    def GridEmbedding(self, blob_in, emb_dim, wave_length=1000.):
+        num_coords = 2
+        dim = int(emb_dim / (2 * num_coords))
+        range_vec = np.arange(dim, dtype=np.float32) / float(dim)
+        base_vec = np.ones_like(range_vec) * wave_length
+        range_vec = 1.0 / np.power(base_vec, range_vec)
+        range_vec = self.net.Const(range_vec, blob_out='range_vec')
+        blobs_in = self.net.Split([blob_in], [blob_in + '_split' + str(idx) for idx in range(num_coords)], axis=1)
+        blobs_out = []
+        for idx, blob_in in enumerate(blobs_in):
+            tiled_blob_in = self.net.Tile([blob_in], blob_in + '_tiled', axis=1, tiles=dim)
+            div_mat = self.net.Mul([tiled_blob_in, range_vec], '_grid_emb_div_mat' + str(idx), broadcast=1, axis=1)
+            sin_mat = self.net.Sin(div_mat, '_grid_emb_sin_mat' + str(idx))
+            cos_mat = self.net.Cos(div_mat, '_grid_emb_cos_mat' + str(idx))
+            blobs_out += [sin_mat, cos_mat]
+
+        embedding, _ = self.net.Concat(
+            blobs_out, ['grid_embedding', '_grid_emb_concat'],
+            axis=1
+        )
+        return embedding
 
     def ConvShared(
         self,
